@@ -7,7 +7,7 @@ import * as backend from 'storex/ts/types/backend'
 import { augmentCreateObject } from 'storex/ts/backend/utils'
 import { getDexieHistory, getTermsIndex } from './schema'
 import { DexieMongoify } from './types'
-import { IndexDefinition, CollectionField, CollectionDefinition } from 'storex/ts/types';
+import { IndexDefinition, CollectionField, CollectionDefinition, isChildOfRelationship, isConnectsRelationship } from 'storex/ts/types';
 import { StorageBackendFeatureSupport } from 'storex/ts/types/backend-features';
 
 export interface IndexedDbImplementation {
@@ -22,6 +22,7 @@ export class DexieStorageBackend extends backend.StorageBackend {
         count: true,
         createWithRelationships: true,
         fullTextSearch: true,
+        relationshipFetching: true,
     }
 
     private dbName : string
@@ -134,6 +135,17 @@ export class DexieStorageBackend extends backend.StorageBackend {
         }
 
         const docs = await coll.toArray()
+        if (findOpts.relationships) {
+            console.log('fetching relationships', findOpts.relationships)
+            const collectionDefinition = this.registry.collections[collection]
+            const pkField = collectionDefinition.pkIndex as string
+            for (const doc of docs) {
+                const pk = doc[pkField]
+                Object.assign(doc, await this._fetchRelatedObjects(collection, pk, findOpts.relationships))
+            }
+            console.log('fetched relationships')
+        }
+
         return docs as T[]
     }
     
@@ -155,6 +167,77 @@ export class DexieStorageBackend extends backend.StorageBackend {
 
     async count(collection : string, query) {
         return this.dexie.collection(collection).count(query)
+    }
+
+    async _fetchRelatedObjects(mainCollectionName : string, mainPk : string, relationships : backend.RelationshipFetch) {
+        let relationshipsWithOptions = []
+        if (Array.isArray(relationships)) {
+            relationshipsWithOptions = relationships.map(aliasPath => [aliasPath, null])
+        } else {
+            relationshipsWithOptions = Object.entries(relationships)
+        }
+
+        const mainRelationshipAliases = []
+        const relationshipAliasPathsByChild = {}
+        for (const [aliasPath, relationshipOptions] of relationshipsWithOptions) {
+            const aliasPathParts = aliasPath.split('.')
+            if (aliasPathParts.length === 1) {
+                mainRelationshipAliases.push(aliasPath)
+            } else {
+                const childAlias = aliasPathParts[0]
+                relationshipAliasPathsByChild[childAlias] = relationshipAliasPathsByChild[childAlias] || []
+                relationshipAliasPathsByChild[childAlias].push(aliasPathParts.slice(1).join('.'))
+            }
+        }
+
+        console.log('mainRelationshipAliases', mainRelationshipAliases)
+
+        const relatedObjects = {}
+        const mainCollectionDefinition = this.registry.collections[mainCollectionName]
+        for (const childAlias of mainRelationshipAliases) {
+            const reverseRelationship = mainCollectionDefinition.reverseRelationshipsByAlias[childAlias]
+            if (isChildOfRelationship(reverseRelationship)) {
+                const childCollectionName = reverseRelationship.sourceCollection
+                // const childCollection = this.registry.collections[childCollectionName]
+                if (reverseRelationship.single) {
+                    const child = await this.findObject(childCollectionName, {[reverseRelationship.alias]: mainPk})
+                    relatedObjects[childAlias] = child
+                } else {
+                    console.log('fetch children', childCollectionName, {[reverseRelationship.alias]: mainPk})
+                    const children = await this.findObjects(childCollectionName, {[reverseRelationship.alias]: mainPk})
+                    relatedObjects[childAlias] = children
+                }
+            } else if (isConnectsRelationship(reverseRelationship)) {
+
+            }
+        }
+
+        for (const [childAlias, paths] of Object.entries(relationshipAliasPathsByChild)) {
+            const reverseRelationship = mainCollectionDefinition.reverseRelationshipsByAlias[childAlias]
+            if (isChildOfRelationship(reverseRelationship)) {
+                const childCollectionName = reverseRelationship.sourceCollection
+                const childCollectionDefinition = this.registry.collections[childCollectionName]
+                const assignRelatedObjects = async child => {
+                    const childPk = child[childCollectionDefinition.pkIndex as string]
+                    const childRelatedObjects = await this._fetchRelatedObjects(childCollectionName, childPk, paths)
+                    Object.assign(child, childRelatedObjects)
+                }
+
+                if (reverseRelationship.single) {
+                    const child = relatedObjects[childAlias]
+                    await assignRelatedObjects(child)
+                } else {
+                    const children = relatedObjects[childAlias]
+                    await Promise.all(children.map(assignRelatedObjects))
+                }
+            } else if (isConnectsRelationship(reverseRelationship)) {
+
+            }
+        }
+
+        console.log('relatedObjects', relatedObjects)
+
+        return relatedObjects
     }
 }
 
